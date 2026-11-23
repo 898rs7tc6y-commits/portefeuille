@@ -216,3 +216,9 @@ body.private .money { filter: blur(7px); }
 
 .settings-list .row { cursor: pointer; }
 .file-input { display: none; }
+
+.equiv { font-weight: 400; }
+details summary { list-style: none; }
+details summary::-webkit-details-marker { display: none; }
+details summary::before { content: '▸ '; }
+details[open] summary::before { content: '▾ '; }

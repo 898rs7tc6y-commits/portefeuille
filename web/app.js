@@ -31,6 +31,25 @@ const EXPENSE_CATEGORIES = {
 
 const GOAL_EMOJIS = ['🏠', '🚗', '✈️', '🎓', '💍', '👶', '🛟', '🏖️', '💻', '🎯'];
 
+/** Devises publiées par la BCE (taux de référence quotidiens). */
+const CURRENCIES = {
+  EUR: 'Euro', USD: 'Dollar américain', GBP: 'Livre sterling', CHF: 'Franc suisse',
+  CAD: 'Dollar canadien', JPY: 'Yen japonais', AUD: 'Dollar australien', NZD: 'Dollar néo-zélandais',
+  CNY: 'Yuan chinois', HKD: 'Dollar de Hong Kong', SGD: 'Dollar de Singapour', KRW: 'Won sud-coréen',
+  INR: 'Roupie indienne', SEK: 'Couronne suédoise', NOK: 'Couronne norvégienne', DKK: 'Couronne danoise',
+  ISK: 'Couronne islandaise', PLN: 'Zloty polonais', CZK: 'Couronne tchèque', HUF: 'Forint hongrois',
+  RON: 'Leu roumain', TRY: 'Livre turque', ILS: 'Shekel israélien', ZAR: 'Rand sud-africain',
+  BRL: 'Réal brésilien', MXN: 'Peso mexicain', THB: 'Baht thaïlandais', IDR: 'Roupie indonésienne',
+  MYR: 'Ringgit malaisien', PHP: 'Peso philippin',
+};
+
+/** Sources des taux (base EUR). La 2e sert de secours. */
+const FX_URLS = [
+  'https://api.frankfurter.dev/v1/latest?base=EUR',
+  'https://api.frankfurter.app/latest?from=EUR',
+];
+const FX_MAX_AGE = 6 * 3600 * 1000;
+
 /* ---------- Utilitaires ---------- */
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -43,11 +62,30 @@ const num = (v) => {
 };
 const round2 = (n) => Math.round(n * 100) / 100;
 
-const fmtEUR = new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' });
-const fmtEUR0 = new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 });
 const fmtPct = new Intl.NumberFormat('fr-FR', { style: 'percent', maximumFractionDigits: 1, signDisplay: 'exceptZero' });
-const money = (n, compact = false) => `<span class="money">${(compact ? fmtEUR0 : fmtEUR).format(n)}</span>`;
-const signedMoney = (n) => `<span class="money">${n > 0 ? '+' : ''}${fmtEUR.format(n)}</span>`;
+const fmtCache = {};
+function fmtCur(n, cur = base(), compact = false) {
+  const k = cur + (compact ? '0' : '');
+  fmtCache[k] ||= new Intl.NumberFormat('fr-FR', {
+    style: 'currency', currency: cur,
+    ...(compact ? { minimumFractionDigits: 0, maximumFractionDigits: 0 } : {}),
+  });
+  return fmtCache[k].format(n);
+}
+/** Symbole d'une devise (€, $, £, CHF…). */
+function sym(cur = base()) {
+  return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: cur }).formatToParts(0).find((p) => p.type === 'currency')?.value || cur;
+}
+const money = (n, compact = false, cur = base()) => `<span class="money">${fmtCur(n, cur, compact)}</span>`;
+const signedMoney = (n, cur = base()) => `<span class="money">${n > 0 ? '+' : ''}${fmtCur(n, cur)}</span>`;
+/** Montant dans sa devise + équivalent en devise principale si différente. */
+function moneyWithEquiv(n, cur, compact = false) {
+  if (!cur || cur === base()) return money(n, compact);
+  return `${money(n, compact, cur)}<div class="sub equiv">≈ ${money(toBase(n, cur), compact)}</div>`;
+}
+function currencyOptions(selected) {
+  return Object.entries(CURRENCIES).map(([c, l]) => `<option value="${c}" ${c === selected ? 'selected' : ''}>${c} · ${esc(l)}</option>`).join('');
+}
 
 const pad = (n) => String(n).padStart(2, '0');
 const isoDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -86,7 +124,8 @@ function defaultState() {
     expenses: [],
     goals: [],
     history: [],
-    settings: { weeklyBudget: 250, hideAmounts: false },
+    fx: { date: '', fetchedAt: 0, rates: {} },
+    settings: { weeklyBudget: 250, hideAmounts: false, baseCurrency: 'EUR', manualRates: {}, lastExpenseCurrency: '' },
   };
 }
 
@@ -123,6 +162,55 @@ function snapshotNetWorth() {
   if (state.history.length > 1500) state.history = state.history.slice(-1500);
 }
 
+/* ---------- Devises & taux de change ---------- */
+
+function base() { return state.settings.baseCurrency || 'EUR'; }
+const missingRates = new Set();
+
+/** Nombre d'unités de `cur` pour 1 €, ou null si inconnu. */
+function rateVsEUR(cur) {
+  if (!cur || cur === 'EUR') return 1;
+  const m = num(state.settings.manualRates?.[cur]);
+  if (m > 0) return m;
+  const r = num(state.fx?.rates?.[cur]);
+  return r > 0 ? r : null;
+}
+function convert(amount, from, to) {
+  from ||= base(); to ||= base();
+  if (from === to) return amount;
+  const rf = rateVsEUR(from), rt = rateVsEUR(to);
+  if (!rf || !rt) { missingRates.add(!rf ? from : to); return amount; }
+  return (amount / rf) * rt;
+}
+const toBase = (amount, cur) => convert(amount, cur, base());
+
+function usedCurrencies() {
+  const s = new Set();
+  state.accounts.forEach((a) => a.currency && s.add(a.currency));
+  state.expenses.forEach((e) => e.currency && s.add(e.currency));
+  s.delete(base());
+  return [...s].sort();
+}
+
+async function refreshRates(force = false) {
+  if (!force && Date.now() - (state.fx?.fetchedAt || 0) < FX_MAX_AGE) return true;
+  for (const url of FX_URLS) {
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) continue;
+      const j = await res.json();
+      if (!j || typeof j.rates !== 'object') continue;
+      const rates = {};
+      for (const [k, v] of Object.entries(j.rates)) if (/^[A-Z]{3}$/.test(k) && num(v) > 0) rates[k] = num(v);
+      state.fx = { date: String(j.date || today()), fetchedAt: Date.now(), rates };
+      missingRates.clear();
+      save(); render();
+      return true;
+    } catch { /* hors ligne : on garde les derniers taux */ }
+  }
+  return false;
+}
+
 /* ---------- Calculs ---------- */
 
 function positionsValue(acc) {
@@ -131,12 +219,23 @@ function positionsValue(acc) {
 function positionsCost(acc) {
   return (acc.positions || []).reduce((s, p) => s + num(p.qty) * num(p.pru), 0);
 }
+/** Valeur dans la devise du compte. */
 function accountValue(acc) { return num(acc.cash) + positionsValue(acc); }
-function netWorth() { return state.accounts.reduce((s, a) => s + accountValue(a), 0); }
+/** Valeur convertie dans la devise principale. */
+function accountValueBase(acc) { return toBase(accountValue(acc), acc.currency); }
+function netWorth() { return state.accounts.reduce((s, a) => s + accountValueBase(a), 0); }
+
+function allocationByCurrency() {
+  const map = {};
+  for (const a of state.accounts) { const c = a.currency || base(); map[c] = (map[c] || 0) + accountValueBase(a); }
+  const palette = ['var(--c1)', 'var(--c3)', 'var(--c2)', 'var(--c4)', 'var(--c5)', 'var(--c6)', 'var(--c7)'];
+  return Object.entries(map).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])
+    .map(([c, value], i) => ({ key: c, label: `${c} · ${CURRENCIES[c] || c}`, color: palette[i % palette.length], value }));
+}
 
 function allocationByType() {
   const map = {};
-  for (const a of state.accounts) map[a.type] = (map[a.type] || 0) + accountValue(a);
+  for (const a of state.accounts) map[a.type] = (map[a.type] || 0) + accountValueBase(a);
   return Object.entries(map)
     .filter(([, v]) => v > 0)
     .map(([type, value]) => ({ key: type, label: ACCOUNT_TYPES[type]?.label || type, color: ACCOUNT_TYPES[type]?.color || 'var(--c7)', value }))
@@ -148,8 +247,9 @@ function expensesInRange(from, toExcl) {
   return state.expenses.filter((e) => e.date >= a && e.date < b);
 }
 function weekTotal(start) {
-  return expensesInRange(start, addDays(start, 7)).reduce((s, e) => s + num(e.amount), 0);
+  return expensesInRange(start, addDays(start, 7)).reduce((s, e) => s + expenseBase(e), 0);
 }
+function expenseBase(e) { return toBase(num(e.amount), e.currency); }
 
 function historyDelta(days) {
   if (state.history.length < 2) return null;
@@ -176,7 +276,7 @@ function goalStats(g) {
 function goalSaved(g) {
   if (g.accountId) {
     const acc = state.accounts.find((a) => a.id === g.accountId);
-    if (acc) return accountValue(acc);
+    if (acc) return accountValueBase(acc);
   }
   return num(g.saved);
 }
@@ -275,6 +375,7 @@ function go(tab) {
 function render() {
   document.body.classList.toggle('private', !!state.settings.hideAmounts);
   $('#btn-privacy').classList.toggle('on', !!state.settings.hideAmounts);
+  missingRates.clear();
   const view = $('#view');
   view.innerHTML = ({ home: viewHome, accounts: viewAccounts, expenses: viewExpenses, goals: viewGoals })[currentTab]();
 }
@@ -289,8 +390,11 @@ function viewHome() {
   const spent = weekTotal(ws);
   const budget = num(state.settings.weeklyBudget);
   const invested = state.accounts.filter((a) => ACCOUNT_TYPES[a.type]?.invest && (a.positions || []).length);
-  const pv = invested.reduce((s, a) => s + positionsValue(a), 0);
-  const pc = invested.reduce((s, a) => s + positionsCost(a), 0);
+  const pv = invested.reduce((s, a) => s + toBase(positionsValue(a), a.currency), 0);
+  const pc = invested.reduce((s, a) => s + toBase(positionsCost(a), a.currency), 0);
+  const byCur = allocationByCurrency();
+  const fxWarn = missingRates.size ? `
+    <div class="card install-tip" data-action="fx" style="cursor:pointer"><p>⚠️ Taux de change manquant pour <strong>${esc([...missingRates].join(', '))}</strong> : les totaux sont approximatifs. Touchez ici pour actualiser ou saisir le taux.</p></div>` : '';
 
   const installTip = isIOS() && !isStandalone() ? `
     <div class="card install-tip"><p>📲 <strong>Installer l'app :</strong> touchez <strong>Partager</strong> <svg class="inline-icon" style="width:16px;height:16px;vertical-align:-3px" viewBox="0 0 24 24"><path d="M12 3v13M7 8l5-5 5 5M5 12v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8"/></svg> puis <strong>« Sur l'écran d'accueil »</strong>.</p></div>` : '';
@@ -306,9 +410,9 @@ function viewHome() {
       </div>`;
   }
 
-  return `${installTip}
+  return `${installTip}${fxWarn}
     <div class="card hero">
-      <div class="label">Patrimoine total</div>
+      <div class="label">Patrimoine total <span class="muted">· en ${esc(base())}</span></div>
       <div class="big">${money(total)}</div>
       ${d30 ? `<div class="delta ${d30.abs >= 0 ? 'pos' : 'neg'}">${signedMoney(d30.abs)} (${fmtPct.format(d30.pct)}) <span class="muted" style="font-weight:400">depuis le ${esc(fmtShort.format(parseISO(d30.since)))}</span></div>` : '<div class="delta muted" style="font-weight:400">Mettez à jour vos soldes régulièrement pour suivre l\'évolution.</div>'}
       <div style="margin-top:12px">${lineSVG(state.history.slice(-180))}</div>
@@ -318,6 +422,13 @@ function viewHome() {
       <h2>Répartition</h2>
       <div class="donut-wrap">${donutSVG(alloc)}${legendHTML(alloc, total)}</div>
     </div>
+
+    ${byCur.length > 1 ? `
+    <div class="card" data-action="fx" style="cursor:pointer">
+      <h2>Par devise <span style="text-transform:none;letter-spacing:0;font-weight:400">· équivalent en ${esc(base())}</span></h2>
+      ${legendHTML(byCur, total)}
+      <div class="muted" style="font-size:12px;margin-top:10px">${fxSourceLabel()}</div>
+    </div>` : ''}
 
     ${invested.length ? `
     <div class="card">
@@ -359,7 +470,7 @@ function viewAccounts() {
   const order = Object.keys(ACCOUNT_TYPES);
   const html = order.filter((t) => groups[t]).map((t) => {
     const list = groups[t];
-    const sum = list.reduce((s, a) => s + accountValue(a), 0);
+    const sum = list.reduce((s, a) => s + accountValueBase(a), 0);
     return `<div class="section-title"><h2>${esc(ACCOUNT_TYPES[t].label)}</h2><span class="muted">${money(sum, true)}</span></div>
       <div class="card" style="padding-top:4px;padding-bottom:4px">${list.map(accountRowHTML).join('')}</div>`;
   }).join('');
@@ -370,19 +481,22 @@ function viewAccounts() {
 
 function accountRowHTML(a) {
   const t = ACCOUNT_TYPES[a.type] || ACCOUNT_TYPES.autre;
+  const cur = a.currency || base();
   const v = accountValue(a);
   let sub = esc(a.institution || t.label);
+  if (cur !== base()) sub += ` · ${esc(cur)}`;
   let extra = '';
   if ((a.positions || []).length) {
     const pv = positionsValue(a), pc = positionsCost(a), g = pv - pc;
     sub += ` · ${a.positions.length} ligne${a.positions.length > 1 ? 's' : ''}`;
-    if (pc) extra = `<div class="sub ${g >= 0 ? 'pos' : 'neg'}">${signedMoney(round2(g))} (${fmtPct.format(g / pc)})</div>`;
+    if (pc) extra = `<div class="sub ${g >= 0 ? 'pos' : 'neg'}">${signedMoney(round2(g), cur)} (${fmtPct.format(g / pc)})</div>`;
   }
   const upd = a.updatedAt ? `<div class="sub">maj ${esc(fmtShort.format(new Date(a.updatedAt)))}</div>` : '';
+  const equiv = cur !== base() ? `<div class="sub equiv">≈ ${money(toBase(v, cur))}</div>` : '';
   return `<div class="row tappable" data-action="edit-account" data-id="${a.id}">
     <div class="badge">${t.emoji}</div>
     <div class="main"><div class="title">${esc(a.name)}</div><div class="sub">${sub}</div></div>
-    <div class="amount">${money(v)}${extra || upd}</div></div>`;
+    <div class="amount">${money(v, false, cur)}${equiv}${extra || (equiv ? '' : upd)}</div></div>`;
 }
 
 /* ---------- Vue : Dépenses ---------- */
@@ -392,7 +506,7 @@ function viewExpenses() {
   const ws = addDays(thisWeek, weekOffset * 7);
   const we = addDays(ws, 7);
   const list = expensesInRange(ws, we).sort((a, b) => b.date.localeCompare(a.date) || (b.createdAt || 0) - (a.createdAt || 0));
-  const total = list.reduce((s, e) => s + num(e.amount), 0);
+  const total = list.reduce((s, e) => s + expenseBase(e), 0);
   const budget = num(state.settings.weeklyBudget);
 
   // 8 dernières semaines jusqu'à la semaine affichée
@@ -404,7 +518,7 @@ function viewExpenses() {
   const avg = bars.slice(0, 7).reduce((s, b) => s + b.value, 0) / 7;
 
   const byCat = {};
-  for (const e of list) byCat[e.category] = (byCat[e.category] || 0) + num(e.amount);
+  for (const e of list) byCat[e.category] = (byCat[e.category] || 0) + expenseBase(e);
   const cats = Object.entries(byCat).map(([k, v]) => ({
     key: k, value: v,
     label: `${EXPENSE_CATEGORIES[k]?.emoji || ''} ${EXPENSE_CATEGORIES[k]?.label || k}`,
@@ -442,7 +556,7 @@ function viewExpenses() {
 
     ${Object.keys(days).length ? Object.entries(days).map(([d, es]) => `
       <div class="section-title"><h2 style="font-size:16px;text-transform:capitalize">${esc(fmtDay.format(parseISO(d)))}</h2>
-        <span class="muted">${money(es.reduce((s, e) => s + num(e.amount), 0))}</span></div>
+        <span class="muted">${money(es.reduce((s, e) => s + expenseBase(e), 0))}</span></div>
       <div class="card" style="padding-top:4px;padding-bottom:4px">${es.map(expenseRowHTML).join('')}</div>`).join('')
       : `<div class="card empty"><p>Aucune dépense cette semaine.</p><button class="btn" data-action="add-expense">Ajouter une dépense</button></div>`}
     <button class="fab" data-action="add-expense" aria-label="Ajouter une dépense">+</button>`;
@@ -454,7 +568,7 @@ function expenseRowHTML(e) {
   return `<div class="row tappable" data-action="edit-expense" data-id="${e.id}">
     <div class="badge">${c.emoji}</div>
     <div class="main"><div class="title">${esc(e.note || c.label)}</div><div class="sub">${esc(c.label)}${acc ? ' · ' + esc(acc.name) : ''}</div></div>
-    <div class="amount">${money(-num(e.amount))}</div></div>`;
+    <div class="amount">${moneyWithEquiv(-num(e.amount), e.currency || base())}</div></div>`;
 }
 
 /* ---------- Vue : Projets ---------- */
@@ -544,21 +658,27 @@ function wireChips(root, onChange) {
 /* Compte */
 function accountForm(acc) {
   const isNew = !acc;
-  const a = acc ? structuredClone(acc) : { id: uid(), name: '', institution: '', type: 'courant', cash: 0, positions: [] };
+  const a = acc ? structuredClone(acc) : { id: uid(), name: '', institution: '', type: 'courant', currency: base(), cash: 0, positions: [] };
+  a.currency ||= base();
   const posRow = (p) => `<div class="pos-edit" data-pid="${p.id}">
       <input class="name-in" name="p_name" placeholder="Nom / ticker (ex. CW8, AAPL)" value="${esc(p.name)}">
       <button type="button" class="rm" data-rm aria-label="Retirer">×</button>
       <div class="inputs">
         <div><div class="mini-label">Quantité</div><input name="p_qty" inputmode="decimal" value="${p.qty ?? ''}"></div>
-        <div><div class="mini-label">PRU (€)</div><input name="p_pru" inputmode="decimal" value="${p.pru ?? ''}"></div>
-        <div><div class="mini-label">Cours (€)</div><input name="p_price" inputmode="decimal" value="${p.price ?? ''}"></div>
+        <div><div class="mini-label">PRU (<span data-sym>${esc(sym(a.currency))}</span>)</div><input name="p_pru" inputmode="decimal" value="${p.pru ?? ''}"></div>
+        <div><div class="mini-label">Cours (<span data-sym>${esc(sym(a.currency))}</span>)</div><input name="p_price" inputmode="decimal" value="${p.price ?? ''}"></div>
       </div></div>`;
+  const cashLabel = (type, cur) => `${ACCOUNT_TYPES[type]?.invest ? 'Liquidités / espèces' : 'Solde'} (${sym(cur)})`;
   const body = `
     <div class="field"><label>Type</label>${chipsHTML('type', ACCOUNT_TYPES, a.type)}</div>
     <div class="field"><label>Nom du compte</label><input name="name" required placeholder="ex. Compte joint, PEA Boursorama, Revolut Actions" value="${esc(a.name)}"></div>
-    <div class="field"><label>Établissement</label><input name="institution" placeholder="ex. BNP, Boursorama, Revolut, Trade Republic" value="${esc(a.institution)}"></div>
-    <div class="field"><label data-cash-label>${ACCOUNT_TYPES[a.type]?.invest ? 'Liquidités / espèces (€)' : 'Solde (€)'}</label>
-      <input name="cash" inputmode="decimal" placeholder="0,00" value="${a.cash || a.cash === 0 ? String(a.cash).replace('.', ',') : ''}"></div>
+    <div class="field-row">
+      <div class="field"><label>Établissement</label><input name="institution" placeholder="ex. BNP, Revolut" value="${esc(a.institution)}"></div>
+      <div class="field"><label>Devise</label><select name="currency">${currencyOptions(a.currency)}</select></div>
+    </div>
+    <div class="field"><label data-cash-label>${esc(cashLabel(a.type, a.currency))}</label>
+      <input name="cash" inputmode="decimal" placeholder="0,00" value="${a.cash || a.cash === 0 ? String(a.cash).replace('.', ',') : ''}">
+      <div class="muted equiv-live" data-equiv style="font-size:13px;padding-left:4px"></div></div>
     <div data-positions ${ACCOUNT_TYPES[a.type]?.invest ? '' : 'hidden'}>
       <div class="field"><label>Lignes (actions, ETF, fonds…)</label>
         <div class="positions" data-pos-list>${(a.positions || []).map(posRow).join('') || ''}</div>
@@ -573,6 +693,7 @@ function accountForm(acc) {
       a.name = name;
       a.institution = String(fd.get('institution') || '').trim();
       a.type = fd.get('type');
+      a.currency = fd.get('currency') || base();
       a.cash = round2(num(fd.get('cash')));
       a.positions = ACCOUNT_TYPES[a.type]?.invest ? [...form.querySelectorAll('.pos-edit')].map((row) => ({
         id: row.dataset.pid,
@@ -592,26 +713,53 @@ function accountForm(acc) {
       save(); render(); toast('Compte supprimé');
     },
   });
+  const form = $('form', sheet);
+  const curType = () => $('input[name=type]', sheet).value;
+  // Équivalent en devise principale, mis à jour pendant la saisie
+  const updateEquiv = () => {
+    const cur = form.currency.value;
+    $('[data-cash-label]', sheet).textContent = cashLabel(curType(), cur);
+    sheet.querySelectorAll('[data-sym]').forEach((s) => { s.textContent = sym(cur); });
+    const el = $('[data-equiv]', sheet);
+    if (cur === base()) { el.textContent = ''; return; }
+    let total = num(form.cash.value);
+    if (ACCOUNT_TYPES[curType()]?.invest) {
+      sheet.querySelectorAll('.pos-edit').forEach((r) => { total += num($('[name=p_qty]', r).value) * num($('[name=p_price]', r).value); });
+    }
+    el.textContent = rateVsEUR(cur)
+      ? `Valeur totale ≈ ${fmtCur(toBase(total, cur))} (1 ${cur} = ${fmtRate(convert(1, cur, base()))} ${base()})`
+      : `Taux ${cur} inconnu : actualisez les taux dans Réglages.`;
+  };
   wireChips(sheet, (type) => {
-    const inv = ACCOUNT_TYPES[type]?.invest;
-    $('[data-positions]', sheet).hidden = !inv;
-    $('[data-cash-label]', sheet).textContent = inv ? 'Liquidités / espèces (€)' : 'Solde (€)';
+    $('[data-positions]', sheet).hidden = !ACCOUNT_TYPES[type]?.invest;
+    updateEquiv();
   });
+  form.currency.addEventListener('change', updateEquiv);
+  form.addEventListener('input', updateEquiv);
   const list = $('[data-pos-list]', sheet);
   $('[data-add-pos]', sheet).addEventListener('click', () => {
     list.insertAdjacentHTML('beforeend', posRow({ id: uid(), name: '', qty: '', pru: '', price: '' }));
+    updateEquiv();
     list.lastElementChild.querySelector('input').focus();
   });
-  list.addEventListener('click', (e) => { if (e.target.closest('[data-rm]')) e.target.closest('.pos-edit').remove(); });
+  list.addEventListener('click', (e) => { if (e.target.closest('[data-rm]')) { e.target.closest('.pos-edit').remove(); updateEquiv(); } });
+  updateEquiv();
 }
+
+const fmtRate = (r) => new Intl.NumberFormat('fr-FR', { maximumSignificantDigits: 5 }).format(r);
 
 /* Dépense */
 function expenseForm(exp) {
   const isNew = !exp;
-  const e = exp ? { ...exp } : { id: uid(), date: today(), amount: '', category: 'courses', note: '', accountId: '' };
+  const e = exp ? { ...exp } : { id: uid(), date: today(), amount: '', category: 'courses', note: '', accountId: '', currency: state.settings.lastExpenseCurrency || base() };
+  e.currency ||= base();
   const accOpts = state.accounts.filter((a) => !ACCOUNT_TYPES[a.type]?.invest);
   const body = `
-    <div class="field"><label>Montant (€)</label><input name="amount" inputmode="decimal" placeholder="0,00" style="font-size:28px;font-weight:700" value="${e.amount !== '' ? String(e.amount).replace('.', ',') : ''}"></div>
+    <div class="field-row" style="grid-template-columns:1fr 120px">
+      <div class="field"><label>Montant</label><input name="amount" inputmode="decimal" placeholder="0,00" style="font-size:28px;font-weight:700" value="${e.amount !== '' ? String(e.amount).replace('.', ',') : ''}"></div>
+      <div class="field"><label>Devise</label><select name="currency" style="font-size:20px;font-weight:600;height:100%">${Object.keys(CURRENCIES).map((c) => `<option value="${c}" ${c === e.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
+    </div>
+    <div class="muted" data-equiv style="font-size:14px;margin-top:-6px;padding-left:4px"></div>
     <div class="field"><label>Catégorie</label>${chipsHTML('category', EXPENSE_CATEGORIES, e.category)}</div>
     <div class="field-row">
       <div class="field"><label>Date</label><input type="date" name="date" value="${esc(e.date)}"></div>
@@ -623,7 +771,8 @@ function expenseForm(exp) {
     onSubmit(fd) {
       const amount = round2(num(fd.get('amount')));
       if (amount <= 0) { toast('Montant invalide'); return false; }
-      Object.assign(e, { amount, category: fd.get('category'), date: fd.get('date') || today(), note: String(fd.get('note') || '').trim(), accountId: fd.get('accountId') || '' });
+      Object.assign(e, { amount, currency: fd.get('currency') || base(), category: fd.get('category'), date: fd.get('date') || today(), note: String(fd.get('note') || '').trim(), accountId: fd.get('accountId') || '' });
+      state.settings.lastExpenseCurrency = e.currency;
       if (isNew) { e.createdAt = Date.now(); state.expenses.push(e); }
       else state.expenses[state.expenses.findIndex((x) => x.id === e.id)] = e;
       // positionne la vue sur la semaine de la dépense
@@ -634,6 +783,20 @@ function expenseForm(exp) {
   });
   if (isNew) setTimeout(() => form.amount.focus(), 250);
   wireChips(form);
+  const updateEquiv = () => {
+    const cur = form.currency.value, amt = num(form.amount.value);
+    const el = $('[data-equiv]', form);
+    if (cur === base()) { el.textContent = ''; return; }
+    el.textContent = rateVsEUR(cur) ? `≈ ${fmtCur(toBase(amt, cur))}  ·  1 ${cur} = ${fmtRate(convert(1, cur, base()))} ${base()}` : `Taux ${cur} inconnu : actualisez les taux dans Réglages.`;
+  };
+  form.amount.addEventListener('input', updateEquiv);
+  form.currency.addEventListener('change', updateEquiv);
+  // Choisir le compte propose sa devise
+  form.accountId.addEventListener('change', () => {
+    const acc = state.accounts.find((a) => a.id === form.accountId.value);
+    if (acc?.currency) { form.currency.value = acc.currency; updateEquiv(); }
+  });
+  updateEquiv();
 }
 
 /* Projet */
@@ -645,14 +808,14 @@ function goalForm(goal) {
     <div class="field"><label>Icône</label>${chipsHTML('emoji', emojiOpts, g.emoji)}</div>
     <div class="field"><label>Nom du projet</label><input name="name" placeholder="ex. Apport appartement, Voyage Japon" value="${esc(g.name)}"></div>
     <div class="field-row">
-      <div class="field"><label>Objectif (€)</label><input name="target" inputmode="decimal" placeholder="10 000" value="${g.target !== '' ? String(g.target).replace('.', ',') : ''}"></div>
+      <div class="field"><label>Objectif (${esc(sym())})</label><input name="target" inputmode="decimal" placeholder="10 000" value="${g.target !== '' ? String(g.target).replace('.', ',') : ''}"></div>
       <div class="field"><label>Échéance</label><input type="month" name="deadline" value="${esc(g.deadline)}"></div>
     </div>
     <div class="field"><label>Suivre la progression via</label><select name="accountId">
       <option value="">Montant saisi manuellement</option>
       ${state.accounts.map((a) => `<option value="${a.id}" ${a.id === g.accountId ? 'selected' : ''}>Solde de : ${esc(a.name)}</option>`).join('')}
     </select></div>
-    <div class="field" data-saved-field ${g.accountId ? 'hidden' : ''}><label>Déjà épargné (€)</label><input name="saved" inputmode="decimal" placeholder="0" value="${g.saved ? String(g.saved).replace('.', ',') : ''}"></div>`;
+    <div class="field" data-saved-field ${g.accountId ? 'hidden' : ''}><label>Déjà épargné (${esc(sym())})</label><input name="saved" inputmode="decimal" placeholder="0" value="${g.saved ? String(g.saved).replace('.', ',') : ''}"></div>`;
   const { form } = openSheet(isNew ? 'Nouveau projet' : 'Modifier le projet', body, {
     onSubmit(fd) {
       const name = String(fd.get('name') || '').trim();
@@ -673,9 +836,12 @@ function goalForm(goal) {
 /* Réglages */
 function settingsSheet() {
   const body = `
-    <div class="field"><label>Budget hebdomadaire de dépenses (€)</label>
+    <div class="field"><label>Devise principale (totaux, budget, projets)</label>
+      <select name="baseCurrency">${currencyOptions(base())}</select></div>
+    <div class="field"><label>Budget hebdomadaire de dépenses (${esc(sym())})</label>
       <input name="weeklyBudget" inputmode="decimal" placeholder="0 = pas de budget" value="${state.settings.weeklyBudget || ''}"></div>
     <div class="card settings-list" style="padding:4px 16px;margin:0">
+      <div class="row" data-s="fx"><div class="badge">💱</div><div class="main"><div class="title">Taux de change</div><div class="sub">${esc(fxSourceLabel())}</div></div></div>
       <div class="row" data-s="export"><div class="badge">💾</div><div class="main"><div class="title">Exporter une sauvegarde</div><div class="sub">Fichier JSON à garder dans Fichiers / iCloud</div></div></div>
       <div class="row" data-s="import"><div class="badge">📥</div><div class="main"><div class="title">Importer une sauvegarde</div><div class="sub">Remplace les données actuelles</div></div></div>
       <div class="row" data-s="csv"><div class="badge">🧾</div><div class="main"><div class="title">Importer des dépenses (CSV)</div><div class="sub">Colonnes : date;montant;catégorie;note</div></div></div>
@@ -683,13 +849,22 @@ function settingsSheet() {
     </div>
     <input type="file" class="file-input" accept="application/json,.json" data-file="json">
     <input type="file" class="file-input" accept=".csv,text/csv,text/plain" data-file="csv">
-    <p class="muted" style="font-size:13px;margin:0">🔒 Vos données restent uniquement sur cet iPhone : rien n'est envoyé sur Internet. Pensez à exporter une sauvegarde de temps en temps.</p>`;
+    <p class="muted" style="font-size:13px;margin:0">🔒 Vos données restent uniquement sur cet iPhone. La seule connexion Internet sert à télécharger les taux de change de la BCE : aucune donnée personnelle n'est envoyée. Pensez à exporter une sauvegarde de temps en temps.</p>`;
   const { form } = openSheet('Réglages', body, {
-    onSubmit(fd) { state.settings.weeklyBudget = round2(num(fd.get('weeklyBudget'))); save(); render(); toast('Réglages enregistrés'); },
+    onSubmit(fd) {
+      const newBase = fd.get('baseCurrency') || base();
+      const budget = round2(num(fd.get('weeklyBudget')));
+      if (newBase !== base()) {
+        if (!changeBaseCurrency(newBase)) { toast(`Taux ${newBase} inconnu : actualisez les taux d'abord`); return false; }
+        state.settings.weeklyBudget = round2(convert(budget, state.settings.prevBase, newBase));
+      } else state.settings.weeklyBudget = budget;
+      save(); render(); toast('Réglages enregistrés');
+    },
   });
   form.addEventListener('click', (e) => {
     const r = e.target.closest('[data-s]'); if (!r) return;
     const act = r.dataset.s;
+    if (act === 'fx') { closeSheet(); fxSheet(); return; }
     if (act === 'export') exportJSON();
     if (act === 'import') $('[data-file=json]', form).click();
     if (act === 'csv') $('[data-file=csv]', form).click();
@@ -711,6 +886,73 @@ function settingsSheet() {
     const f = e.target.files[0]; if (!f) return;
     const n = importCSV(await f.text());
     save(); closeSheet(); render(); toast(n ? `${n} dépense(s) importée(s)` : 'Aucune ligne reconnue');
+  });
+}
+
+/**
+ * Change la devise principale : les montants exprimés dans l'ancienne devise
+ * (projets, historique) sont convertis ; comptes et dépenses gardent leur devise.
+ */
+function changeBaseCurrency(newBase) {
+  const old = base();
+  if (!rateVsEUR(newBase) || !rateVsEUR(old)) return false;
+  const k = convert(1, old, newBase);
+  state.accounts.forEach((a) => { a.currency ||= old; });
+  state.expenses.forEach((e) => { e.currency ||= old; });
+  state.goals.forEach((g) => { g.target = round2(num(g.target) * k); g.saved = round2(num(g.saved) * k); });
+  state.history.forEach((h) => { h.total = round2(h.total * k); });
+  state.settings.prevBase = old;
+  state.settings.baseCurrency = newBase;
+  return true;
+}
+
+function fxSourceLabel() {
+  if (!state.fx?.date) return 'Taux non téléchargés';
+  const d = parseISO(state.fx.date);
+  return `Taux BCE du ${fmtShort.format(d)} ${d.getFullYear()}`;
+}
+
+/** Feuille des taux de change : consultation, actualisation, taux manuels. */
+function fxSheet() {
+  const used = usedCurrencies();
+  const others = Object.keys(CURRENCIES).filter((c) => c !== base() && !used.includes(c));
+  const manual = state.settings.manualRates || {};
+  const line = (c) => {
+    const auto = num(state.fx?.rates?.[c]) || (c === 'EUR' ? 1 : 0);
+    const r = rateVsEUR(c);
+    const inBase = r ? convert(1, c, base()) : null;
+    return `<div class="row" style="flex-wrap:wrap">
+      <div class="main"><div class="title">${c} <span class="muted" style="font-weight:400">· ${esc(CURRENCIES[c] || c)}</span></div>
+        <div class="sub">${inBase ? `1 ${c} = ${fmtRate(inBase)} ${base()}` : 'taux inconnu'}${num(manual[c]) > 0 ? ' · <strong>manuel</strong>' : ''}</div></div>
+      ${c === 'EUR' ? '' : `<div style="width:120px"><div class="mini-label">1 € = … ${c}</div>
+        <input name="m_${c}" inputmode="decimal" placeholder="${auto ? fmtRate(auto) : 'auto'}" value="${num(manual[c]) > 0 ? String(manual[c]).replace('.', ',') : ''}"
+          style="border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:8px;font-size:16px;width:100%"></div>`}
+    </div>`;
+  };
+  const body = `
+    <div class="card" style="margin:0">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <div><strong>${esc(fxSourceLabel())}</strong><div class="muted" style="font-size:13px">Source : Banque centrale européenne, mise à jour chaque jour ouvré</div></div>
+        <button type="button" class="btn secondary" data-refresh>Actualiser</button>
+      </div>
+    </div>
+    ${used.length ? `<div class="field"><label>Devises utilisées</label><div class="card" style="margin:0;padding:0 16px">${used.map(line).join('')}</div></div>` : ''}
+    <details><summary class="muted" style="padding:4px;cursor:pointer">Toutes les devises</summary>
+      <div class="card" style="margin:8px 0 0;padding:0 16px">${others.map(line).join('')}</div></details>
+    <p class="muted" style="font-size:13px;margin:0">Laissez vide pour utiliser le taux BCE. Un taux manuel remplace le taux automatique.</p>`;
+  const { form } = openSheet('Taux de change', body, {
+    onSubmit(fd) {
+      const m = {};
+      for (const [k, v] of fd.entries()) if (k.startsWith('m_') && num(v) > 0) m[k.slice(2)] = num(v);
+      state.settings.manualRates = m;
+      save(); render(); toast('Taux enregistrés');
+    },
+  });
+  $('[data-refresh]', form).addEventListener('click', async (ev) => {
+    ev.target.disabled = true; ev.target.textContent = '…';
+    const ok = await refreshRates(true);
+    toast(ok ? 'Taux mis à jour' : 'Pas de connexion : taux non mis à jour');
+    if (ok) { closeSheet(); fxSheet(); } else { ev.target.disabled = false; ev.target.textContent = 'Actualiser'; }
   });
 }
 
@@ -766,10 +1008,10 @@ function loadDemo() {
       { id: uid(), name: 'ETF S&P 500', qty: 120, pru: 38.2, price: 44.9 },
       { id: uid(), name: 'Air Liquide', qty: 10, pru: 152, price: 168.4 },
     ] },
-    { id: uid(), name: 'Revolut Actions', institution: 'Revolut', type: 'cto', cash: 58, positions: [
-      { id: uid(), name: 'Apple', qty: 8, pru: 165, price: 210.2 },
-      { id: uid(), name: 'Nvidia', qty: 12, pru: 98, price: 128.5 },
-      { id: uid(), name: 'Tesla', qty: 3, pru: 260, price: 231 },
+    { id: uid(), name: 'Revolut Actions', institution: 'Revolut', type: 'cto', currency: 'USD', cash: 64, positions: [
+      { id: uid(), name: 'Apple', qty: 8, pru: 178, price: 228.4 },
+      { id: uid(), name: 'Nvidia', qty: 12, pru: 106, price: 139.6 },
+      { id: uid(), name: 'Tesla', qty: 3, pru: 282, price: 251 },
     ] },
   ].map((a) => ({ ...a, updatedAt: Date.now() }));
   const cats = ['courses', 'restaurant', 'transport', 'loisirs', 'shopping', 'abonnements'];
@@ -790,6 +1032,8 @@ function loadDemo() {
     { id: uid(), name: 'Voyage au Japon', emoji: '✈️', target: 4500, saved: 1800, deadline: `${y + 1}-04` },
   ];
   s.settings.weeklyBudget = 350;
+  s.fx = state.fx; s.settings.manualRates = state.settings.manualRates || {};
+  s.expenses.push({ id: uid(), date: isoDate(addDays(now, -1)), amount: 18.5, currency: 'USD', category: 'abonnements', note: 'App Store (USD)', createdAt: Date.now() });
   state = s;
   // historique fictif sur 120 jours
   const final = netWorth();
@@ -830,6 +1074,7 @@ $('#view').addEventListener('click', (e) => {
     case 'week-prev': weekOffset--; render(); break;
     case 'week-next': weekOffset = Math.min(0, weekOffset + 1); render(); break;
     case 'demo': loadDemo(); break;
+    case 'fx': fxSheet(); break;
   }
 });
 $('#sheet-backdrop').addEventListener('click', closeSheet);
@@ -840,6 +1085,8 @@ $('#btn-privacy').addEventListener('click', () => {
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet(); });
 
 render();
+refreshRates();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshRates(); });
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});

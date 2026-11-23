@@ -1,5 +1,5 @@
 // Service worker : met l'application en cache pour un fonctionnement hors ligne.
-const CACHE = 'portefeuille-v1';
+const CACHE = 'portefeuille-v2';
 const ASSETS = [
   './',
   'index.html',

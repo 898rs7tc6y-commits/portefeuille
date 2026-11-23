@@ -6,7 +6,9 @@ Application iPhone (PWA) pour suivre en un seul endroit :
 - **Dépenses par semaine** : saisie rapide, budget hebdo, catégories, historique sur 8 semaines, import CSV.
 - **Projets financiers** : objectif, échéance, épargne mensuelle nécessaire, suivi manuel ou lié au solde d'un compte.
 
-Les données restent **uniquement sur l'appareil** (stockage local du navigateur). Aucun serveur, aucun compte. Fonctionne hors ligne.
+**Multi-devises** : chaque compte et chaque dépense a sa devise (USD, GBP, CHF…), avec l'équivalent dans la devise principale (EUR par défaut). Taux de référence BCE téléchargés automatiquement (via Frankfurter), modifiables à la main.
+
+Les données restent **uniquement sur l'appareil** (stockage local du navigateur). Aucun serveur, aucun compte. Fonctionne hors ligne (avec les derniers taux connus). La seule requête réseau sert à récupérer les taux de change ; aucune donnée personnelle n'est envoyée.
 
 ## Installer sur iPhone
 
