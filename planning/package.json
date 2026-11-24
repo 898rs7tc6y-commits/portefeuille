@@ -1,0 +1,10 @@
+{
+  "name": "planning",
+  "private": true,
+  "description": "Planning perso : shifts Tanda + sommeil + Uber Eats + sport + temps libre, en flux calendrier",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "apercu": "node cli.js test/exemple-tanda.ics --date 2026-11-30"
+  }
+}

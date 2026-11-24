@@ -1,0 +1,3 @@
+{
+  "rewrites": [{ "source": "/planning.ics", "destination": "/api/planning" }]
+}

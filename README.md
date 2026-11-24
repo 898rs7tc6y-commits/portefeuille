@@ -10,6 +10,10 @@ Application iPhone (PWA) pour suivre en un seul endroit :
 
 Les données restent **uniquement sur l'appareil** (stockage local du navigateur). Aucun serveur, aucun compte. Fonctionne hors ligne (avec les derniers taux connus). La seule requête réseau sert à récupérer les taux de change ; aucune donnée personnelle n'est envoyée.
 
+## Planning (dossier `planning/`)
+
+Calendrier d'abonnement généré à partir des shifts Tanda : sommeil, Uber Eats, sport et temps libre placés automatiquement. Voir [`planning/README.md`](planning/README.md).
+
 ## Installer sur iPhone
 
 1. Activer GitHub Pages : *Settings → Pages → Source : GitHub Actions* (le workflow `.github/workflows/pages.yml` déploie le dossier `web/` à chaque push sur `main`).
